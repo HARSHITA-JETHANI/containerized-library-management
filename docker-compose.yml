@@ -1,0 +1,24 @@
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: library-backend-compose
+    restart: unless-stopped
+    environment:
+      PORT: 5000
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in the root .env file}
+    volumes:
+      - ./library.db:/library.db
+    expose:
+      - "5000"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: library-frontend-compose
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
