@@ -20,6 +20,9 @@ frontend/dist/
 *.sqlite
 *.sqlite3
 *.bak
+backups/
+.last_deployed_sha
+
 
 # Logs
 *.log
