@@ -27,12 +27,14 @@ flowchart TD
     end
 
     subgraph Local_Container_Deployment["Local Docker Deployment (Desktop Linux / WSL2)"]
-        LocalAgent -->|"Detects new successful CI SHA"| DeployScript
+        LocalAgent -->|"Requires local HEAD to match exact CI-passed SHA"| DeployScript
+        DeployScript -->|"Preflight: files, env, Docker, Compose"| Preflight["Validated Configuration"]
         DeployScript -->|"1. Snapshot SQLite to ./backups/"| Backup[("SQLite Snapshot")]
-        DeployScript -->|"2. git pull origin main"| GitPull["Updated Source"]
+        DeployScript -->|"2. Optional git pull for direct deployments"| GitPull["Updated Source"]
         DeployScript -->|"3. docker compose build"| DockerBuild["Build Updated Images"]
         DeployScript -->|"4. docker compose up -d"| ComposeUp["Update Running Containers"]
-        DeployScript -->|"5. Health & Auth Verification"| HealthCheck["Verify /api/health & Auth"]
+        DeployScript -->|"5. API and frontend health checks"| HealthCheck["Verify Availability"]
+        DeployScript -->|"On failure, restore images when prior pair exists"| ImageRollback["Image Rollback"]
 
         subgraph Docker_Compose_Stack["Docker Compose Stack"]
             Nginx["Nginx Reverse Proxy (Frontend Container: 5173->80)"]
@@ -81,14 +83,18 @@ flowchart TD
 
 1. You push new commits to the `main` branch on GitHub.
 2. GitHub Actions runs the CI workflow (`.github/workflows/ci.yml`), executing backend tests and verifying the frontend build.
-3. The local Continuous Deployment Agent (`scripts/cd-agent.ps1`) runs locally in PowerShell and queries the GitHub Actions API for the latest successful workflow run on `main`.
-4. When a new successful CI commit SHA is verified, the agent executes `scripts/deploy.ps1`:
-   - **Step 1:** Verifies environment configuration and creates an automated snapshot of `library.db` in `backups/`.
-   - **Step 2:** Pulls the verified commit from `origin/main`.
-   - **Step 3:** Rebuilds only the updated Docker images (`docker compose build`) using Docker's layer cache.
-   - **Step 4:** Recreates and restarts the updated containers (`docker compose up -d`). Unchanged containers remain untouched.
-   - **Step 5:** Performs post-deployment health verification (`/api/health`), tests frontend HTML loading, and executes a functional authentication check against SQLite.
-   - **Step 6:** Updates `.last_deployed_sha` to mark the deployment complete.
+3. The local Continuous Deployment Agent (`scripts/cd-agent.ps1`) checks GitHub Actions for a completed successful push workflow matching the exact full SHA on `main`. It deploys only when local `HEAD` matches that SHA, and invokes the deploy script with `-SkipPull` to prevent deploying a newer, unverified remote commit.
+4. The deploy script validates required files, `.env`, Docker, Compose, and Compose configuration before creating a database snapshot or changing deployment state. A direct run without `-SkipPull` also requires a clean `main` worktree and pulls `origin/main` after the snapshot.
+5. It preserves available prior Compose images, builds and updates containers, and checks `/api/health` and frontend HTML. A failed build stops the deployment. An update or health failure attempts image rollback when a complete prior backend/frontend image pair exists; it does not restore `library.db`.
+6. The CD agent updates `.last_deployed_sha` only after deployment succeeds. It stores a failed SHA in `.last_failed_sha` to suppress repeat attempts for that commit.
+
+### Non-Destructive Deployment Preflight
+
+Run `-DryRun` to validate required files, `.env`, Docker daemon availability, Compose availability, and Compose configuration. The script exits before creating backups, pulling code, building images, or changing containers:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "scripts/deploy.ps1" -DryRun
+```
 
 ### Starting the Local CD Agent
 
@@ -114,17 +120,24 @@ powershell -ExecutionPolicy Bypass -File "scripts/cd-agent.ps1" -RunOnce
 ### Zero Data Loss Guarantees
 - The SQLite database file `library.db` is located on the host machine and bind-mounted to `/library.db` inside the backend container.
 - Before **every deployment**, `scripts/deploy.ps1` automatically saves a timestamped snapshot into the `backups/` directory (e.g., `backups/library_backup_20261018_202758.db`).
-- The database is **never** reinitialized or overwritten during deployment.
+- Deployment and image-only rollback do not copy over or restore `library.db`; the running application continues to write data to the mounted database.
 
 ### Safe Rollback Procedure
-If an issue occurs or you need to restore an earlier database state:
+The default rollback restores application images only and preserves the current database:
 
 ```powershell
-# Rollback to the most recent pre-deployment snapshot
+# Rollback application images only; library.db is untouched
 powershell -ExecutionPolicy Bypass -File "scripts/rollback.ps1"
+```
 
-# Or rollback to a specific snapshot
-powershell -ExecutionPolicy Bypass -File "scripts/rollback.ps1" -BackupFile "backups/library_backup_YYYYMMDD_HHMMSS.db"
+To restore database data, explicitly use `-RestoreDatabase`:
+
+```powershell
+# Restore the latest snapshot
+powershell -ExecutionPolicy Bypass -File "scripts/rollback.ps1" -RestoreDatabase
+
+# Or restore a specific snapshot
+powershell -ExecutionPolicy Bypass -File "scripts/rollback.ps1" -RestoreDatabase -BackupFile "backups/library_backup_YYYYMMDD_HHMMSS.db"
 ```
 
 ---

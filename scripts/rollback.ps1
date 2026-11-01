@@ -20,8 +20,9 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = "E:\Harshi\7th SEM\CLOUD AUTOMATION\LibraryManagement"
-Set-Location $ProjectRoot
+$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$DatabasePath = Join-Path $ProjectRoot "library.db"
+$ComposeArgs = @('--project-directory', $ProjectRoot, '--project-name', 'librarymanagement')
 
 function Write-Step {
     param([string]$Message)
@@ -44,13 +45,14 @@ try {
         
         $targetBackup = $null
         if ($BackupFile) {
-            if (-not (Test-Path $BackupFile)) {
+            $resolvedBackup = if ([System.IO.Path]::IsPathRooted($BackupFile)) { $BackupFile } else { Join-Path $ProjectRoot $BackupFile }
+            if (-not (Test-Path -LiteralPath $resolvedBackup -PathType Leaf)) {
                 throw "Specified backup file does not exist: $BackupFile"
             }
-            $targetBackup = (Get-Item $BackupFile).FullName
+            $targetBackup = (Get-Item -LiteralPath $resolvedBackup).FullName
         } else {
             $backupDir = Join-Path $ProjectRoot "backups"
-            if (-not (Test-Path $backupDir)) {
+            if (-not (Test-Path -LiteralPath $backupDir -PathType Container)) {
                 throw "No backups directory found at $backupDir"
             }
             $latest = Get-ChildItem -Path $backupDir -Filter "library_backup_*.db" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -62,30 +64,37 @@ try {
 
         Write-Host "Selected backup snapshot: $targetBackup" -ForegroundColor Yellow
         Write-Host "Gracefully stopping backend container..." -ForegroundColor Yellow
-        docker compose stop backend
+        docker compose @ComposeArgs stop backend
+        if ($LASTEXITCODE -ne 0) { throw "Docker Compose failed to stop the backend before database restoration." }
 
-        Copy-Item $targetBackup "library.db" -Force
+        Copy-Item -LiteralPath $targetBackup -Destination $DatabasePath -Force
         Write-Success "Restored library.db from $targetBackup"
 
         Write-Host "Restarting containers..." -ForegroundColor Yellow
-        docker compose up -d
+        docker compose @ComposeArgs up -d
+        if ($LASTEXITCODE -ne 0) { throw "Docker Compose failed to restart after database restoration." }
     } else {
         Write-Step "Mode: Application-Only Image Rollback (Preserving Database)"
         
         # Check if :previous images exist
-        $prevBackend = docker images librarymanagement-backend:previous -q
-        $prevFrontend = docker images librarymanagement-frontend:previous -q
+        $prevBackend = docker image inspect librarymanagement-backend:previous --format '{{.Id}}' 2>$null
+        $backendInspectExit = $LASTEXITCODE
+        $prevFrontend = docker image inspect librarymanagement-frontend:previous --format '{{.Id}}' 2>$null
+        $frontendInspectExit = $LASTEXITCODE
 
-        if (-not $prevBackend -or -not $prevFrontend) {
+        if ($backendInspectExit -ne 0 -or $frontendInspectExit -ne 0 -or -not $prevBackend -or -not $prevFrontend) {
             throw "Previous image tags (:previous) were not found. Cannot perform instant image rollback. To restore database snapshot instead, run with -RestoreDatabase."
         }
 
         Write-Host "Retagging :previous images to :latest..." -ForegroundColor Yellow
         docker tag librarymanagement-backend:previous librarymanagement-backend:latest
+        if ($LASTEXITCODE -ne 0) { throw "Failed to retag the previous backend image." }
         docker tag librarymanagement-frontend:previous librarymanagement-frontend:latest
+        if ($LASTEXITCODE -ne 0) { throw "Failed to retag the previous frontend image." }
 
         Write-Host "Re-deploying containers using previous images..." -ForegroundColor Yellow
-        docker compose up -d
+        docker compose @ComposeArgs up -d
+        if ($LASTEXITCODE -ne 0) { throw "Docker Compose failed to restart the previous images." }
 
         Write-Success "Re-deployed previous application version. Database data was preserved completely intact."
     }
@@ -97,7 +106,7 @@ try {
     for ($i = 1; $i -le $maxRetries; $i++) {
         try {
             $health = Invoke-RestMethod -Uri "http://localhost:5173/api/health" -Method Get -TimeoutSec 3 -ErrorAction Stop
-            if ($health.status -eq "ok") {
+            if ($null -ne $health -and $health.status -eq "ok") {
                 $healthy = $true
                 break
             }
@@ -111,11 +120,7 @@ try {
     }
     Write-Success "API Health check passed: status=ok"
 
-    $body = @{ username = "admin"; password = "admin123" } | ConvertTo-Json
-    $loginRes = Invoke-RestMethod -Uri "http://localhost:5173/api/auth/login" -Method Post -Body $body -ContentType "application/json"
-    $headers = @{ "Authorization" = "Bearer $($loginRes.token)" }
-    $books = Invoke-RestMethod -Uri "http://localhost:5173/api/books" -Method Get -Headers $headers
-    Write-Success "Rollback verified: $($books.Count) books accessible in library database."
+    Write-Success "Rollback health check passed. The image-only rollback path does not copy to or restore library.db."
 
     Write-Step "ROLLBACK COMPLETE"
     Write-Success "Application restored and operational at http://localhost:5173"

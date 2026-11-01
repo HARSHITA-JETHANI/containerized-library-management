@@ -22,6 +22,7 @@ frontend/dist/
 *.bak
 backups/
 .last_deployed_sha
+.last_failed_sha
 
 
 # Logs
